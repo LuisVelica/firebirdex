@@ -18,6 +18,21 @@ defmodule Firebirdex.Connection do
   # each level uniquely by its depth instead.
   defp savepoint_name(depth), do: "firebirdex_savepoint_#{depth}"
 
+  # After a hard commit/rollback the transaction is closed; Firebird requires an active
+  # transaction for any statement, so we open a fresh autocommit base. This makes writes
+  # outside a Repo.transaction commit (with commit_retaining the base was left without
+  # autocommit and they were lost) and returns the status to :idle so the next transaction
+  # can start again.
+  defp rebase_autocommit(conn) do
+    case :efirebirdsql_protocol.begin_transaction(true, conn) do
+      {:ok, conn} ->
+        {:ok, %Result{}, %__MODULE__{conn: conn, transaction_status: :idle}}
+      {:error, errno, reason, conn} ->
+        {:disconnect, %Error{number: errno, reason: reason},
+         %__MODULE__{conn: conn, transaction_status: :idle}}
+    end
+  end
+
   @impl true
   def connect(opts) do
     hostname = to_charlist(opts[:hostname])
@@ -61,7 +76,10 @@ defmodule Firebirdex.Connection do
     charset = econn(state.conn, :charset)
 
     {:ok, stmt} = :efirebirdsql_protocol.unallocate_statement(to_string(query))
-    {:ok, %Query{query | stmt: stmt, charset: charset}, %__MODULE__{state | conn: state.conn, transaction_status: :transaction}}
+    # Do NOT force transaction_status here. Setting it to :transaction makes it stick after
+    # the first query, so handle_begin's `status == :idle` guard stops starting the real
+    # transaction -> everything runs on the autocommit base and rollback has nothing to undo.
+    {:ok, %Query{query | stmt: stmt, charset: charset}, %__MODULE__{state | conn: state.conn}}
   end
 
   defp convert_param(%Decimal{} = value, _charset) do
@@ -126,6 +144,9 @@ defmodule Firebirdex.Connection do
   def handle_begin(opts, %{conn: conn, transaction_status: status} = s) do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction when status == :idle ->
+        # Close the autocommit base before opening the explicit transaction, so it is not
+        # left orphaned (otherwise the connection accumulates 2 transactions per Repo.transaction).
+        _ = :efirebirdsql_protocol.commit(conn)
         case :efirebirdsql_protocol.begin_transaction(false, conn) do
           {:ok, conn} ->
             {:ok, %Result{}, %__MODULE__{conn: conn, transaction_status: :transaction}}
@@ -152,9 +173,11 @@ defmodule Firebirdex.Connection do
   def handle_commit(opts, %{conn: conn, transaction_status: status} = s) do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction when status == :transaction ->
-        case :efirebirdsql_protocol.commit_retaining(conn) do
+        # Hard commit (closes the transaction) and reopen the autocommit base, so later
+        # standalone writes commit and the next transaction can start.
+        case :efirebirdsql_protocol.commit(conn) do
           :ok ->
-            {:ok, %Result{}, s}
+            rebase_autocommit(conn)
           {:error, _errno, _reason} ->
             {:error, s}
         end
@@ -177,9 +200,10 @@ defmodule Firebirdex.Connection do
   def handle_rollback(opts, %{conn: conn, transaction_status: status} = s) do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction when status == :transaction ->
-        case :efirebirdsql_protocol.rollback_retaining(conn) do
+        # Hard rollback and reopen the autocommit base (same reason as handle_commit).
+        case :efirebirdsql_protocol.rollback(conn) do
           :ok ->
-            {:ok, %Result{}, s}
+            rebase_autocommit(conn)
           {:error, _errno, _reason} ->
             {:error, s}
         end
