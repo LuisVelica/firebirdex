@@ -9,7 +9,14 @@ defmodule Firebirdex.Connection do
   defstruct [
     :conn,
     :transaction_status,
+    savepoint_depth: 0,
   ]
+
+  # Firebird, unlike PostgreSQL, does not stack savepoints that share a name:
+  # re-declaring a savepoint with an existing name replaces it, so a fixed name
+  # makes the outer level of a nested transaction impossible to roll back. Name
+  # each level uniquely by its depth instead.
+  defp savepoint_name(depth), do: "firebirdex_savepoint_#{depth}"
 
   @impl true
   def connect(opts) do
@@ -127,9 +134,10 @@ defmodule Firebirdex.Connection do
         end
 
       :savepoint when status == :transaction ->
-        case :efirebirdsql_protocol.exec_immediate("SAVEPOINT firebirdex_savepoint", conn) do
+        depth = s.savepoint_depth + 1
+        case :efirebirdsql_protocol.exec_immediate("SAVEPOINT #{savepoint_name(depth)}", conn) do
           :ok ->
-            {:ok, %Result{}, s}
+            {:ok, %Result{}, %{s | savepoint_depth: depth}}
           {:error, _errno, _reason, _conn} ->
             {:error, s}
         end
@@ -152,9 +160,10 @@ defmodule Firebirdex.Connection do
         end
 
       :savepoint when status == :transaction ->
-        case :efirebirdsql_protocol.exec_immediate("RELEASE SAVEPOINT firebirdex_savepoint", conn) do
+        depth = s.savepoint_depth
+        case :efirebirdsql_protocol.exec_immediate("RELEASE SAVEPOINT #{savepoint_name(depth)}", conn) do
           :ok ->
-            {:ok, %Result{}, s}
+            {:ok, %Result{}, %{s | savepoint_depth: max(depth - 1, 0)}}
           {:error, _errno, _reason, _conn} ->
             {:error, s}
         end
@@ -176,9 +185,10 @@ defmodule Firebirdex.Connection do
         end
 
       :savepoint when status == :transaction ->
-        case :efirebirdsql_protocol.exec_immediate("ROLLBACK TO SAVEPOINT firebirdex_savepoint", conn) do
+        depth = s.savepoint_depth
+        case :efirebirdsql_protocol.exec_immediate("ROLLBACK TO SAVEPOINT #{savepoint_name(depth)}", conn) do
           :ok ->
-            {:ok, %Result{}, s}
+            {:ok, %Result{}, %{s | savepoint_depth: max(depth - 1, 0)}}
           {:error, _errno, _reason, _conn} ->
             {:error, s}
         end
