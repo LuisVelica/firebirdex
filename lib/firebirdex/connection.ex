@@ -119,12 +119,20 @@ defmodule Firebirdex.Connection do
     params = Enum.map(params, &convert_param(&1, econn(state.conn, :charset)))
     case :efirebirdsql_protocol.execute(state.conn, query.stmt, params) do
       {:ok, stmt} ->
-        {:ok, rows, stmt} = :efirebirdsql_protocol.fetchall(state.conn, stmt)
-        desc = :efirebirdsql_protocol.columns(stmt)
-        columns = Enum.map(desc, &(column_name(&1)))
-        {:ok, num_rows} = :efirebirdsql_protocol.rowcount(state.conn, stmt)
-        {:ok, stmt} = :efirebirdsql_protocol.free_statement(state.conn, stmt, :drop)
-        {:ok, %Query{query | stmt: stmt}, %Result{desc: desc, columns: columns, num_rows: num_rows, rows: rows}, %__MODULE__{state | conn: state.conn}}
+        # efirebirdsql (post nakagami/firebirdsql#265) can return {:error, ...} mid-read from
+        # fetchall/rowcount/free_statement. A strict `=` match crashed the connection process
+        # with {badmatch, {:error,...}}, hiding the real SQL error. Route any of them to the
+        # same error clause used by `execute`. The success path is byte-for-byte identical.
+        with {:ok, rows, stmt} <- :efirebirdsql_protocol.fetchall(state.conn, stmt),
+             desc = :efirebirdsql_protocol.columns(stmt),
+             columns = Enum.map(desc, &column_name(&1)),
+             {:ok, num_rows} <- :efirebirdsql_protocol.rowcount(state.conn, stmt),
+             {:ok, stmt} <- :efirebirdsql_protocol.free_statement(state.conn, stmt, :drop) do
+          {:ok, %Query{query | stmt: stmt}, %Result{desc: desc, columns: columns, num_rows: num_rows, rows: rows}, %__MODULE__{state | conn: state.conn}}
+        else
+          {:error, number, reason} ->
+            {:error, %Error{number: number, reason: reason, statement: query.statement}, %__MODULE__{state | conn: state.conn}}
+        end
       {:error, number, reason} ->
         {:error, %Error{number: number, reason: reason, statement: query.statement}, %__MODULE__{state | conn: state.conn}}
     end
@@ -159,7 +167,9 @@ defmodule Firebirdex.Connection do
         case :efirebirdsql_protocol.exec_immediate("SAVEPOINT #{savepoint_name(depth)}", conn) do
           :ok ->
             {:ok, %Result{}, %{s | savepoint_depth: depth}}
-          {:error, _errno, _reason, _conn} ->
+          # exec_immediate/2 returns a 3-tuple {:error, errno, reason}; matching the 4-tuple
+          # form crashed with CaseClauseError whenever a savepoint statement failed.
+          {:error, _errno, _reason} ->
             {:error, s}
         end
 
@@ -187,7 +197,8 @@ defmodule Firebirdex.Connection do
         case :efirebirdsql_protocol.exec_immediate("RELEASE SAVEPOINT #{savepoint_name(depth)}", conn) do
           :ok ->
             {:ok, %Result{}, %{s | savepoint_depth: max(depth - 1, 0)}}
-          {:error, _errno, _reason, _conn} ->
+          # exec_immediate/2 returns a 3-tuple (see handle_begin).
+          {:error, _errno, _reason} ->
             {:error, s}
         end
 
@@ -213,7 +224,8 @@ defmodule Firebirdex.Connection do
         case :efirebirdsql_protocol.exec_immediate("ROLLBACK TO SAVEPOINT #{savepoint_name(depth)}", conn) do
           :ok ->
             {:ok, %Result{}, %{s | savepoint_depth: max(depth - 1, 0)}}
-          {:error, _errno, _reason, _conn} ->
+          # exec_immediate/2 returns a 3-tuple (see handle_begin).
+          {:error, _errno, _reason} ->
             {:error, s}
         end
 
