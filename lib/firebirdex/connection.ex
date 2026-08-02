@@ -4,32 +4,36 @@ defmodule Firebirdex.Connection do
 
   alias Firebirdex.{Query, Result, Error, Encoding}
   require Record
-  Record.defrecord :econn, Record.extract(:conn, from_lib: "efirebirdsql/include/efirebirdsql.hrl")
+
+  Record.defrecord(
+    :econn,
+    Record.extract(:conn, from_lib: "efirebirdsql/include/efirebirdsql.hrl")
+  )
 
   defstruct [
     :conn,
     :transaction_status,
-    savepoint_depth: 0,
+    savepoint_counter: 0,
+    savepoints: []
   ]
-
-  # Firebird, unlike PostgreSQL, does not stack savepoints that share a name:
-  # re-declaring a savepoint with an existing name replaces it, so a fixed name
-  # makes the outer level of a nested transaction impossible to roll back. Name
-  # each level uniquely by its depth instead.
-  defp savepoint_name(depth), do: "firebirdex_savepoint_#{depth}"
 
   # After a hard commit/rollback the transaction is closed; Firebird requires an active
   # transaction for any statement, so we open a fresh autocommit base. This makes writes
   # outside a Repo.transaction commit (with commit_retaining the base was left without
   # autocommit and they were lost) and returns the status to :idle so the next transaction
   # can start again.
-  defp rebase_autocommit(conn) do
+  defp rebase_autocommit(%__MODULE__{conn: conn} = state) do
     case :efirebirdsql_protocol.begin_transaction(true, conn) do
       {:ok, conn} ->
-        {:ok, %Result{}, %__MODULE__{conn: conn, transaction_status: :idle}}
+        {:ok, %Result{}, %{state | conn: conn, transaction_status: :idle, savepoints: []}}
+
       {:error, errno, reason, conn} ->
         {:disconnect, %Error{number: errno, reason: reason},
-         %__MODULE__{conn: conn, transaction_status: :idle}}
+         %{state | conn: conn, transaction_status: :idle, savepoints: []}}
+
+      {:error, errno, reason} ->
+        {:disconnect, %Error{number: errno, reason: reason},
+         %{state | transaction_status: :idle, savepoints: []}}
     end
   end
 
@@ -40,29 +44,33 @@ defmodule Firebirdex.Connection do
     password = Keyword.get(opts, :password, System.get_env("FIREBIRD_PASSWORD"))
     password = to_charlist(password)
     database = to_charlist(opts[:database])
+
     case :efirebirdsql_protocol.connect(hostname, username, password, database, opts) do
       {:ok, conn} ->
-        {:ok, %__MODULE__{conn: conn, transaction_status: :idle}}
+        {:ok,
+         %__MODULE__{conn: conn, transaction_status: :idle, savepoint_counter: 0, savepoints: []}}
+
       {:error, number, reason, _conn} ->
         {:error, %Error{number: number, reason: reason}}
     end
   end
 
   @impl true
-  def disconnect(_reason,  %__MODULE__{conn: conn}) do
+  def disconnect(_reason, %__MODULE__{conn: conn}) do
     case :efirebirdsql_protocol.close(conn) do
       {:ok, _conn} ->
         :ok
+
       {:error, number, reason, _conn} ->
         {:error, %Error{number: number, reason: reason}}
     end
   end
 
   @impl true
-  def ping( %__MODULE__{conn: conn} = state) do
+  def ping(%__MODULE__{conn: conn} = state) do
     case :efirebirdsql_protocol.ping(conn) do
       :ok -> {:ok, state}
-      :error -> {:disconnect,__MODULE__,state}
+      :error -> {:disconnect, __MODULE__, state}
     end
   end
 
@@ -72,7 +80,7 @@ defmodule Firebirdex.Connection do
   end
 
   @impl true
-  def handle_prepare(%Query{} = query, _opts, state) do
+  def handle_prepare(%Query{} = query, _opts, %__MODULE__{} = state) do
     charset = econn(state.conn, :charset)
 
     {:ok, stmt} = :efirebirdsql_protocol.unallocate_statement(to_string(query))
@@ -115,8 +123,9 @@ defmodule Firebirdex.Connection do
   end
 
   @impl true
-  def handle_execute(%Query{} = query, params, _opts, state) do
+  def handle_execute(%Query{} = query, params, _opts, %__MODULE__{} = state) do
     params = Enum.map(params, &convert_param(&1, econn(state.conn, :charset)))
+
     case :efirebirdsql_protocol.execute(state.conn, query.stmt, params) do
       {:ok, stmt} ->
         # efirebirdsql can return {:error, ...} mid-read from fetchall/rowcount/free_statement
@@ -128,13 +137,18 @@ defmodule Firebirdex.Connection do
              columns = Enum.map(desc, &column_name(&1)),
              {:ok, num_rows} <- :efirebirdsql_protocol.rowcount(state.conn, stmt),
              {:ok, stmt} <- :efirebirdsql_protocol.free_statement(state.conn, stmt, :drop) do
-          {:ok, %Query{query | stmt: stmt}, %Result{desc: desc, columns: columns, num_rows: num_rows, rows: rows}, %__MODULE__{state | conn: state.conn}}
+          {:ok, %Query{query | stmt: stmt},
+           %Result{desc: desc, columns: columns, num_rows: num_rows, rows: rows},
+           %__MODULE__{state | conn: state.conn}}
         else
           {:error, number, reason} ->
-            {:error, %Error{number: number, reason: reason, statement: query.statement}, %__MODULE__{state | conn: state.conn}}
+            {:error, %Error{number: number, reason: reason, statement: query.statement},
+             %__MODULE__{state | conn: state.conn}}
         end
+
       {:error, number, reason} ->
-        {:error, %Error{number: number, reason: reason, statement: query.statement}, %__MODULE__{state | conn: state.conn}}
+        {:error, %Error{number: number, reason: reason, statement: query.statement},
+         %__MODULE__{state | conn: state.conn}}
     end
   end
 
@@ -149,57 +163,104 @@ defmodule Firebirdex.Connection do
   end
 
   @impl true
-  def handle_begin(opts, %{conn: conn, transaction_status: status} = s) do
-    case Keyword.get(opts, :mode, :transaction) do
+  def handle_begin(
+        opts,
+        %__MODULE__{
+          conn: conn,
+          transaction_status: status,
+          savepoint_counter: counter,
+          savepoints: savepoints
+        } = s
+      ) do
+    mode = Keyword.get(opts, :mode, :transaction)
+
+    case mode do
       :transaction when status == :idle ->
         # Close the autocommit base before opening the explicit transaction, so it is not
         # left orphaned (otherwise the connection accumulates 2 transactions per Repo.transaction).
         _ = :efirebirdsql_protocol.commit(conn)
+
         case :efirebirdsql_protocol.begin_transaction(false, conn) do
           {:ok, conn} ->
-            {:ok, %Result{}, %__MODULE__{conn: conn, transaction_status: :transaction}}
+            {:ok, %Result{},
+             %__MODULE__{
+               conn: conn,
+               transaction_status: :transaction,
+               savepoint_counter: counter,
+               savepoints: savepoints
+             }}
+
           {:error, _errno, _reason, _conn} ->
+            {:error, s}
+
+          {:error, _errno, _reason} ->
             {:error, s}
         end
 
       :savepoint when status == :transaction ->
-        depth = s.savepoint_depth + 1
-        case :efirebirdsql_protocol.exec_immediate("SAVEPOINT #{savepoint_name(depth)}", conn) do
+        counter = counter + 1
+        savepoint = "firebirdex_savepoint_#{counter}"
+
+        case :efirebirdsql_protocol.exec_immediate("SAVEPOINT #{savepoint}", conn) do
           :ok ->
-            {:ok, %Result{}, %{s | savepoint_depth: depth}}
-          # exec_immediate/2 returns a 3-tuple {:error, errno, reason}; matching the 4-tuple
-          # form crashed with CaseClauseError whenever a savepoint statement failed.
+            {:ok, %Result{},
+             %__MODULE__{s | savepoint_counter: counter, savepoints: [savepoint | savepoints]}}
+
+          {:error, _errno, _reason, _conn} ->
+            {:error, %__MODULE__{s | savepoint_counter: counter}}
+
           {:error, _errno, _reason} ->
-            {:error, s}
+            {:error, %__MODULE__{s | savepoint_counter: counter}}
         end
 
       mode when mode in [:transaction, :savepoint] ->
         {:ok, %Result{}, s}
     end
-
   end
 
   @impl true
-  def handle_commit(opts, %{conn: conn, transaction_status: status} = s) do
-    case Keyword.get(opts, :mode, :transaction) do
+  def handle_commit(
+        opts,
+        %__MODULE__{conn: conn, transaction_status: status, savepoints: savepoints} = s
+      ) do
+    mode = Keyword.get(opts, :mode, :transaction)
+
+    case mode do
       :transaction when status == :transaction ->
         # Hard commit (closes the transaction) and reopen the autocommit base, so later
         # standalone writes commit and the next transaction can start.
         case :efirebirdsql_protocol.commit(conn) do
           :ok ->
-            rebase_autocommit(conn)
+            rebase_autocommit(s)
+
           {:error, _errno, _reason} ->
             {:error, s}
         end
 
       :savepoint when status == :transaction ->
-        depth = s.savepoint_depth
-        case :efirebirdsql_protocol.exec_immediate("RELEASE SAVEPOINT #{savepoint_name(depth)}", conn) do
-          :ok ->
-            {:ok, %Result{}, %{s | savepoint_depth: max(depth - 1, 0)}}
-          # exec_immediate/2 returns a 3-tuple (see handle_begin).
-          {:error, _errno, _reason} ->
-            {:error, s}
+        case savepoints do
+          [savepoint | rest] ->
+            updated_state = %__MODULE__{s | savepoints: rest}
+
+            case :efirebirdsql_protocol.exec_immediate("RELEASE SAVEPOINT #{savepoint}", conn) do
+              :ok ->
+                {:ok, %Result{}, updated_state}
+
+              {:error, 335_544_820, _reason, _conn} ->
+                {:ok, %Result{}, updated_state}
+
+              {:error, 335_544_820, _reason} ->
+                {:ok, %Result{}, updated_state}
+
+              {:error, _errno, _reason, _conn} ->
+                {:error, s}
+
+              {:error, _errno, _reason} ->
+                {:error, s}
+            end
+
+          [] ->
+            {status, s}
         end
 
       mode when mode in [:transaction, :savepoint] ->
@@ -208,25 +269,47 @@ defmodule Firebirdex.Connection do
   end
 
   @impl true
-  def handle_rollback(opts, %{conn: conn, transaction_status: status} = s) do
-    case Keyword.get(opts, :mode, :transaction) do
+  def handle_rollback(
+        opts,
+        %__MODULE__{conn: conn, transaction_status: status, savepoints: savepoints} = s
+      ) do
+    mode = Keyword.get(opts, :mode, :transaction)
+
+    case mode do
       :transaction when status == :transaction ->
         # Hard rollback and reopen the autocommit base (same reason as handle_commit).
         case :efirebirdsql_protocol.rollback(conn) do
           :ok ->
-            rebase_autocommit(conn)
+            rebase_autocommit(s)
+
           {:error, _errno, _reason} ->
             {:error, s}
         end
 
       :savepoint when status == :transaction ->
-        depth = s.savepoint_depth
-        case :efirebirdsql_protocol.exec_immediate("ROLLBACK TO SAVEPOINT #{savepoint_name(depth)}", conn) do
-          :ok ->
-            {:ok, %Result{}, %{s | savepoint_depth: max(depth - 1, 0)}}
-          # exec_immediate/2 returns a 3-tuple (see handle_begin).
-          {:error, _errno, _reason} ->
-            {:error, s}
+        case savepoints do
+          [savepoint | rest] ->
+            updated_state = %__MODULE__{s | savepoints: rest}
+
+            case :efirebirdsql_protocol.exec_immediate("ROLLBACK TO SAVEPOINT #{savepoint}", conn) do
+              :ok ->
+                {:ok, %Result{}, updated_state}
+
+              {:error, 335_544_820, _reason, _conn} ->
+                {:ok, %Result{}, updated_state}
+
+              {:error, 335_544_820, _reason} ->
+                {:ok, %Result{}, updated_state}
+
+              {:error, _errno, _reason, _conn} ->
+                {:error, s}
+
+              {:error, _errno, _reason} ->
+                {:error, s}
+            end
+
+          [] ->
+            {status, s}
         end
 
       mode when mode in [:transaction, :savepoint] ->
@@ -245,13 +328,13 @@ defmodule Firebirdex.Connection do
   end
 
   @impl true
-  def handle_deallocate(query, _cursor, _opts, state) do
+  def handle_deallocate(query, _cursor, _opts, %__MODULE__{} = state) do
     case :efirebirdsql_protocol.free_statement(state.conn, query.stmt, :drop) do
       {:ok, _stmt} ->
-        {:ok, %Result{}, %__MODULE__{conn: state.conn}}
+        {:ok, %Result{}, %__MODULE__{state | conn: state.conn}}
+
       {:error, _errno, _reason} ->
-        {:error, %__MODULE__{conn: state.conn}}
+        {:error, %__MODULE__{state | conn: state.conn}}
     end
   end
-
 end

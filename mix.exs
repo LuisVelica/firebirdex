@@ -1,13 +1,13 @@
 defmodule Firebirdex.Mixfile do
   use Mix.Project
 
-  @version "0.3.11"
+  @version "0.3.14"
 
   def project() do
     [
       app: :firebirdex,
       version: @version,
-      elixir: "~> 1.4",
+      elixir: "~> 1.18",
       name: "Firebirdex",
       description: "Firebird driver for Elixir",
       source_url: "https://github.com/nakagami/firebirdex",
@@ -19,7 +19,8 @@ defmodule Firebirdex.Mixfile do
 
   def application() do
     [
-      extra_applications: [:logger]
+      extra_applications: [:logger],
+      mod: {Firebirdex.Application, []}
     ]
   end
 
@@ -41,12 +42,12 @@ defmodule Firebirdex.Mixfile do
 
   defp deps() do
     [
-      {:db_connection, "~> 2.4"},
-      {:decimal, "~> 2.1"},
-      {:timex, "~> 3.7"},
+      {:db_connection, "~> 2.10"},
+      {:decimal, "~> 3.1"},
       {:efirebirdsql, "~> 0.9.10"},
       {:codepagex, "~> 0.1.10"},
-      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
+      {:tz, "~> 0.28"},
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false}
     ]
   end
 end

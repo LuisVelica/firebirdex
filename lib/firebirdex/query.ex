@@ -119,7 +119,7 @@ defmodule Firebirdex.Query do
       convert_row([convert_value(c, v, charset) | row], rest_columns, rest_row, charset)
     end
 
-    def decode(query, result, _opts) do
+    def decode(query, %Result{} = result, _opts) do
       rows =
         if result.rows == nil do
           result.rows
